@@ -1,0 +1,1045 @@
+---
+title: "Process batter injury data"
+output: html_notebook
+---
+
+```{r}
+library(pacman)
+pacman::p_load(tidyverse, magrittr, reticulate, Hmisc)
+use_python('/usr/local/bin/python3')
+df <- read_csv(file.choose()) %>% mutate(
+  Notes = gsub('\"','', Notes)
+) %>% mutate(
+  Notes = gsub('\\\\','',Notes)
+)
+
+# create relinquished only dataset
+df %<>% filter(Relinquished_player == 1) %>% select(-Acquired)
+```
+
+Python code to extract all 'transferred' instances to update the previous injury
+```{python}
+import re
+import pandas as pd
+from sys import maxsize
+new_df = []
+for index,row in r.df.iterrows():
+  if re.search('transfer',row['Notes'].lower()):
+    # update previous 
+    old = new_df[-1]
+    day = re.search('(\d{2}).{1,2}day', row['Notes'].lower()).group(1)
+    old['DL'] = day
+    new_df[-1] = old
+    # do not add to new_df
+  else:
+    new_df.append(row)
+for row in new_df:
+  if (int(row['DL']) < 0):
+    row['DL'] = 'NA'
+    row['DTD'] = 1
+for row in new_df:
+  pass
+df = pd.concat(new_df, axis=1).T
+print(df.shape)
+```
+Back to R  
+```{r}
+# make year, month, day columns using Date --> lubridate
+df <- py$df %>% mutate(
+  lubri = lubridate::mdy(Date)
+) %>% mutate(
+  year = lubridate::year(lubri),
+  month = lubridate::month(lubri),
+  day = lubridate::day(lubri)
+) %>% mutate(
+  DTD = unlist(DTD),
+  Minors_rehab = unlist(Minors_rehab),
+  Out_for_season = unlist(Out_for_season),
+  Relinquished_player = unlist(Relinquished_player),
+  DL = unlist(DL),
+  Surgery = unlist(Surgery)
+)  %>% rowwise() %>% 
+    mutate(is10 = if(DL == '10') 1 else 0,
+         is15 = if(DL == '15') 1 else 0,
+         is60 = if(DL == '60') 1 else 0,
+         isOther = if(DL %in% c('20','21')) 1 else 0,
+         isDTD = if(DTD == 1) 1 else 0,
+         isElbow = if(Injury == 'ELBOW') 1 else 0,
+         isLeg = if(Injury == 'LEG') 1 else 0,
+         isOther = if(Injury == 'OTHER') 1 else 0,
+         isKnee = if(Injury == 'KNEE') 1 else 0,
+         isBack = if(Injury == 'BACK') 1 else 0,
+         isHand = if(Injury == 'HAND') 1 else 0,
+         isArm = if(Injury == 'ARM') 1 else 0,
+         isShoulder = if(Injury == 'SHOULDER') 1 else 0,
+         isFoot = if(Injury == 'FOOT') 1 else 0,
+         ) 
+
+df_year <- df %>% 
+  group_by(Relinquished, year) %>% 
+  summarise(num_injuries = sum(c(is10, is15, is60, isDTD)),
+            num_10 = sum(is10),
+            num_15 = sum(is15),
+            num_60 = sum(is60),
+            num_dtd = sum(isDTD),
+            num_surgeries = sum(Surgery),
+            num_minors = sum(Minors_rehab),
+            num_out_for_season = sum(Out_for_season),
+            num_elbow = sum(isElbow),
+            num_leg = sum(isLeg),
+            num_other = sum(isOther),
+            num_knee = sum(isKnee),
+            num_back = sum(isBack),
+            num_hand = sum(isHand),
+            num_arm = sum(isArm),
+            num_shoulder = sum(isShoulder),
+            num_foot = sum(isFoot),
+            total_dl = num_10*10 + num_15*15 + num_60*60 + num_dtd
+            ) %>%
+  mutate(Name = str_trim(gsub('(\\(.*?)\\)','',Relinquished)),
+         Season = year) %>%
+  filter(year > 1999 & year < 2019)
+
+```
+
+```{r}
+# load pitcher and batter stats
+pitcher_stats <- read_csv(file.choose())
+
+batter_stats <- read_csv(file.choose())
+
+batter_war <- read_csv(file.choose())%>% mutate(
+  Name = name_common,
+  Season = year_ID
+) %>% filter(as.numeric(Season) > 1999 & as.numeric(Season) < 2019)
+
+pitcher_war <- read_csv(file.choose())%>% mutate(
+  Name = name_common,
+  Season = year_ID
+) %>% filter(as.numeric(Season) > 1999 & as.numeric(Season) < 2019)
+
+BATTERS <- inner_join(batter_war, batter_stats, by = c('Name','Season'))
+PITCHERS <- inner_join(pitcher_war, pitcher_stats, by = c('Name', 'Season'))
+
+# also need to join batter / pitcher stats
+BATTERS %>% write_csv('FULL_BATTER_STATS.csv')
+PITCHERS %>% write_csv('FULL_PITCHER_STATS.csv')
+
+pitcher_transactions <- read_csv(file.choose()) %>% filter(Relinquished_player == 1)
+
+df_year_players <- df_year %>%rowwise() %>%
+  mutate(pitcher = if((Relinquished %in% pitcher_war$Name) | (Relinquished %in% pitcher_transactions$Relinquished)) 1 else 0)
+```
+
+Clean up WAR_injury  
+
+```{r}
+merge_players_stats <- function(STATS, injury){
+  STATS_injury <- STATS %>% left_join(.,injury, by = c("Name",'Season')) %>% collect() %>%
+  rowwise() %>% 
+  mutate(
+    injury = if(is.na(num_injuries)) 0 else 1,
+    pitcher = pitcher.x
+    ) %>% collect() %>%
+  drop_na(pitcher.x) %>%
+  arrange(Name, Season)
+
+  STATS_injury[c("num_injuries", "num_10", 'num_15','num_60','num_dtd','num_surgeries','num_minors','num_out_for_season','num_elbow','num_leg','num_other','num_knee','num_back','num_hand','num_arm','num_shoulder','num_foot','total_dl')][is.na(STATS_injury[c("num_injuries", "num_10", 'num_15','num_60','num_dtd','num_surgeries','num_minors','num_out_for_season','num_elbow','num_leg','num_other','num_knee','num_back','num_hand','num_arm','num_shoulder','num_foot','total_dl')])] <- 0
+  return(STATS_injury)
+}
+
+merge_pitcher_stats <- function(STATS, injury){
+  STATS_injury <- STATS %>% left_join(.,injury, by = c("Name",'Season')) %>% 
+  rowwise() %>% 
+  mutate(
+    injury = if(is.na(num_injuries)) 0 else 1
+    ) %>% collect() %>%
+  drop_na(pitcher) %>%
+  arrange(Name, Season)
+
+  STATS_injury[c("num_injuries", "num_10", 'num_15','num_60','num_dtd','num_surgeries','num_minors','num_out_for_season','num_elbow','num_leg','num_other','num_knee','num_back','num_hand','num_arm','num_shoulder','num_foot','total_dl')][is.na(STATS_injury[c("num_injuries", "num_10", 'num_15','num_60','num_dtd','num_surgeries','num_minors','num_out_for_season','num_elbow','num_leg','num_other','num_knee','num_back','num_hand','num_arm','num_shoulder','num_foot','total_dl')])] <- 0
+  return(STATS_injury)
+}
+#select(-c(PA.y, G.y, WAR.y, pitcher.y, pitcher.x)) %>% 
+
+BATTER_injury <- merge_players_stats(BATTERS, df_year_players)
+
+BATTER_injury %>% write_csv('BATTER_INJURY.csv')
+
+PITCHER_injury <- merge_pitcher_stats(pitcher_stats, df_year_players)
+
+PITCHER_injury %>% write_csv('PITCHER_INJURY.csv')
+
+```
+Back to python to assign future_injury{total, 15, 20, 60} if the player was injured in the next season  
+  
+    
+```{python}
+import re
+import pandas as pd
+
+def process(DF):
+  new_df = []
+  for index,row in DF.iterrows():
+    try:
+      last_item = new_df[-1]
+    except:
+      # first item, ignore
+      new_df.append(row)
+      continue
+    last_name = last_item['Name']
+    last_year = int(last_item['Season'])
+    if last_name == row['Name'] and last_year < int(row['Season']):
+      # names match and last_item is older
+      # see if player was injured in this season
+      this_injury = int(row['injury'])
+      last_item['include'] = 1
+      # injured this year, update the last item
+      if this_injury != 0:
+        last_item['future_injury'] = 1
+        last_item['future_num_injuries'] = int(row['num_injuries'])
+        last_item['future_num_10'] = int(row['num_10'])
+        last_item['future_num_15'] = int(row['num_15'])
+        last_item['future_num_60'] = int(row['num_60'])
+        last_item['future_num_dtd'] = int(row['num_dtd'])
+        last_item['future_num_surgeries'] = int(row['num_surgeries'])
+        last_item['future_num_minors'] = int(row['num_minors'])
+        last_item['future_num_out_for_season'] = int(row['num_out_for_season'])
+        last_item['future_num_elbow'] = int(row['num_elbow'])
+        last_item['future_num_other'] = int(row['num_other'])
+        last_item['future_num_leg'] = int(row['num_leg'])
+        last_item['future_num_knee'] = int(row['num_knee'])
+        last_item['future_num_back'] = int(row['num_back'])
+        last_item['future_num_hand'] = int(row['num_hand'])
+        last_item['future_num_arm'] = int(row['num_arm'])
+        last_item['future_num_shoulder'] = int(row['num_shoulder'])
+        last_item['future_num_foot'] = int(row['num_foot'])
+        last_item['future_total_dl'] = int(row['total_dl'])
+      # not injured this season, all futures are 0
+      else:
+        last_item['future_injury'] = 0
+        last_item['future_num_injuries'] = 0
+        last_item['future_num_10'] = 0
+        last_item['future_num_15'] = 0
+        last_item['future_num_60'] = 0
+        last_item['future_num_dtd'] = 0
+        last_item['future_num_surgeries'] = 0
+        last_item['future_num_minors'] = 0
+        last_item['future_num_out_for_season'] = 0
+        last_item['future_num_elbow'] = 0
+        last_item['future_num_other'] = 0
+        last_item['future_num_leg'] = 0
+        last_item['future_num_knee'] = 0
+        last_item['future_num_back'] = 0
+        last_item['future_num_hand'] = 0
+        last_item['future_num_arm'] = 0
+        last_item['future_num_shoulder'] = 0
+        last_item['future_num_foot'] = 0
+        last_item['future_total_dl'] = 0
+    else:
+      # this is probably the most recent entry, or no past entry exists, so we can't use it
+      last_item['include'] = 0
+    # update last item
+    new_df[-1] = last_item
+    # add current row to the DF list for the next iteration
+    new_df.append(row)
+  z_df = pd.concat(new_df, axis=1).T
+  return(z_df)
+batter_df = process(r.BATTER_injury)
+pitcher_df = process(r.PITCHER_injury)
+
+# batter_df = process(r.batter_stats)
+# pitcher_df = process(r.pitcher_stats)
+
+```
+
+## Edit and save Batters
+
+```{r}
+batter_df <- py$batter_df %>% mutate(
+  `neg_WPA` = unlist(`+WPA`),
+  `pos_WPA` = unlist(`-WPA`),
+  `1B` = unlist(`1B`),
+  `2B` = unlist(`2B`),
+  `3B` = unlist(`3B`),
+  `AB` = unlist(`AB`),
+  `AVG` = unlist(`AVG`),
+  `Age` = unlist(`Age`),
+  `Age Rng` = unlist(`Age Rng`),
+  `BABIP` = unlist(`BABIP`),
+  `BB` = unlist(`BB`),
+  `BB%` = unlist(`BB%`),
+  `BB/K` = unlist(`BB/K`),
+  `BU` = unlist(`BU`),
+  `BUH` = unlist(`BUH`),
+  `BUH%` = unlist(`BUH%`),
+  `Balls` = unlist(`Balls`),
+  `Bat` = unlist(`Bat`),
+  `BsR` = unlist(`BsR`),
+  `CB%` = unlist(`CB%`),
+  `CBv` = unlist(`CBv`),
+  `CH%` = unlist(`CH%`),
+  `CH% (pfx)` = unlist(`CH% (pfx)`),
+  `CH% (pi)` = unlist(`CH% (pi)`),
+  `CH-X (pfx)` = unlist(`CH-X (pfx)`),
+  `CH-X (pi)` = unlist(`CH-X (pi)`),
+  `CH-Z (pfx)` = unlist(`CH-Z (pfx)`),
+  `CH-Z (pi)` = unlist(`CH-Z (pi)`),
+  `CHv` = unlist(`CHv`),
+  `CS` = unlist(`CS`),
+  `CS% (pi)` = unlist(`CS% (pi)`),
+  `CS-X (pi)` = unlist(`CS-X (pi)`),
+  `CS-Z (pi)` = unlist(`CS-Z (pi)`),
+  `CT%` = unlist(`CT%`),
+  `CTv` = unlist(`CTv`),
+  `CU% (pfx)` = unlist(`CU% (pfx)`),
+  `CU% (pi)` = unlist(`CU% (pi)`),
+  `CU-X (pfx)` = unlist(`CU-X (pfx)`),
+  `CU-X (pi)` = unlist(`CU-X (pi)`),
+  `CU-Z (pfx)` = unlist(`CU-Z (pfx)`),
+  `CU-Z (pi)` = unlist(`CU-Z (pi)`),
+  `Cent%` = unlist(`Cent%`),
+  `Clutch` = unlist(`Clutch`),
+  `Contact%` = unlist(`Contact%`),
+  `Contact% (pfx)` = unlist(`Contact% (pfx)`),
+  `Contact% (pi)` = unlist(`Contact% (pi)`),
+  `Def` = unlist(`Def`),
+  `Dol` = unlist(`Dol`),
+  `EP% (pfx)` = unlist(`EP% (pfx)`),
+  `EP-X (pfx)` = unlist(`EP-X (pfx)`),
+  `EP-Z (pfx)` = unlist(`EP-Z (pfx)`),
+  `F-Strike%` = unlist(`F-Strike%`),
+  `FA% (pfx)` = unlist(`FA% (pfx)`),
+  `FA% (pi)` = unlist(`FA% (pi)`),
+  `FA-X (pfx)` = unlist(`FA-X (pfx)`),
+  `FA-X (pi)` = unlist(`FA-X (pi)`),
+  `FA-Z (pfx)` = unlist(`FA-Z (pfx)`),
+  `FA-Z (pi)` = unlist(`FA-Z (pi)`),
+  `FB` = unlist(`FB`),
+  `FB%` = unlist(`FB%`),
+  `FB% (Pitch)` = unlist(`FB% (Pitch)`),
+  `FBv` = unlist(`FBv`),
+  `FC% (pfx)` = unlist(`FC% (pfx)`),
+  `FC% (pi)` = unlist(`FC% (pi)`),
+  `FC-X (pfx)` = unlist(`FC-X (pfx)`),
+  `FC-X (pi)` = unlist(`FC-X (pi)`),
+  `FC-Z (pfx)` = unlist(`FC-Z (pfx)`),
+  `FC-Z (pi)` = unlist(`FC-Z (pi)`),
+  `FO% (pfx)` = unlist(`FO% (pfx)`),
+  `FO-X (pfx)` = unlist(`FO-X (pfx)`),
+  `FO-Z (pfx)` = unlist(`FO-Z (pfx)`),
+  `FS% (pfx)` = unlist(`FS% (pfx)`),
+  `FS% (pi)` = unlist(`FS% (pi)`),
+  `FS-X (pfx)` = unlist(`FS-X (pfx)`),
+  `FS-X (pi)` = unlist(`FS-X (pi)`),
+  `FS-Z (pfx)` = unlist(`FS-Z (pfx)`),
+  `FS-Z (pi)` = unlist(`FS-Z (pi)`),
+  `FT% (pfx)` = unlist(`FT% (pfx)`),
+  `FT-X (pfx)` = unlist(`FT-X (pfx)`),
+  `FT-Z (pfx)` = unlist(`FT-Z (pfx)`),
+  `Fld` = unlist(`Fld`),
+  `G.x` = unlist(`G.x`),
+  `GB` = unlist(`GB`),
+  `GB%` = unlist(`GB%`),
+  `GB/FB` = unlist(`GB/FB`),
+  `GDP` = unlist(`GDP`),
+  `H` = unlist(`H`),
+  `HBP` = unlist(`HBP`),
+  `HR` = unlist(`HR`),
+  `HR/FB` = unlist(`HR/FB`),
+  `Hard%` = unlist(`Hard%`),
+  `IBB` = unlist(`IBB`),
+  `IFFB` = unlist(`IFFB`),
+  `IFFB%` = unlist(`IFFB%`),
+  `IFH` = unlist(`IFH`),
+  `IFH%` = unlist(`IFH%`),
+  `ISO` = unlist(`ISO`),
+  `Inn` = unlist(`Inn`),
+  `K%` = unlist(`K%`),
+  `KC% (pfx)` = unlist(`KC% (pfx)`),
+  `KC-X (pfx)` = unlist(`KC-X (pfx)`),
+  `KC-Z (pfx)` = unlist(`KC-Z (pfx)`),
+  `KN%` = unlist(`KN%`),
+  `KN% (pfx)` = unlist(`KN% (pfx)`),
+  `KN% (pi)` = unlist(`KN% (pi)`),
+  `KN-X (pfx)` = unlist(`KN-X (pfx)`),
+  `KN-X (pi)` = unlist(`KN-X (pi)`),
+  `KN-Z (pfx)` = unlist(`KN-Z (pfx)`),
+  `KN-Z (pi)` = unlist(`KN-Z (pi)`),
+  `KNv` = unlist(`KNv`),
+  `LD` = unlist(`LD`),
+  `LD%` = unlist(`LD%`),
+  `Lg` = unlist(`Lg`),
+  `Med%` = unlist(`Med%`),
+  `Name` = unlist(`Name`),
+  `O-Contact%` = unlist(`O-Contact%`),
+  `O-Contact% (pfx)` = unlist(`O-Contact% (pfx)`),
+  `O-Contact% (pi)` = unlist(`O-Contact% (pi)`),
+  `O-Swing%` = unlist(`O-Swing%`),
+  `O-Swing% (pfx)` = unlist(`O-Swing% (pfx)`),
+  `O-Swing% (pi)` = unlist(`O-Swing% (pi)`),
+  `OBP` = unlist(`OBP`),
+  `OPS` = unlist(`OPS`),
+  `OPS_plus` = unlist(`OPS_plus`),
+  `Off` = unlist(`Off`),
+  `Oppo%` = unlist(`Oppo%`),
+  `PA.x` = unlist(`PA.x`),
+  `PH` = unlist(`PH`),
+  `PO%` = unlist(`PO%`),
+  `Pace` = unlist(`Pace`),
+  `Pace (pi)` = unlist(`Pace (pi)`),
+  `Pitches` = unlist(`Pitches`),
+  `Pos` = unlist(`Pos`),
+  `Pull%` = unlist(`Pull%`),
+  `R` = unlist(`R`),
+  `RAR` = unlist(`RAR`),
+  `RBI` = unlist(`RBI`),
+  `RE24` = unlist(`RE24`),
+  `REW` = unlist(`REW`),
+  `Relinquished` = unlist(`Relinquished`),
+  `Rep` = unlist(`Rep`),
+  `SB` = unlist(`SB`),
+  `SB% (pi)` = unlist(`SB% (pi)`),
+  `SB-X (pi)` = unlist(`SB-X (pi)`),
+  `SB-Z (pi)` = unlist(`SB-Z (pi)`),
+  `SC% (pfx)` = unlist(`SC% (pfx)`),
+  `SC-X (pfx)` = unlist(`SC-X (pfx)`),
+  `SC-Z (pfx)` = unlist(`SC-Z (pfx)`),
+  `SF` = unlist(`SF`),
+  `SF%` = unlist(`SF%`),
+  `SFv` = unlist(`SFv`),
+  `SH` = unlist(`SH`),
+  `SI% (pfx)` = unlist(`SI% (pfx)`),
+  `SI% (pi)` = unlist(`SI% (pi)`),
+  `SI-X (pfx)` = unlist(`SI-X (pfx)`),
+  `SI-X (pi)` = unlist(`SI-X (pi)`),
+  `SI-Z (pfx)` = unlist(`SI-Z (pfx)`),
+  `SI-Z (pi)` = unlist(`SI-Z (pi)`),
+  `SL%` = unlist(`SL%`),
+  `SL% (pfx)` = unlist(`SL% (pfx)`),
+  `SL% (pi)` = unlist(`SL% (pi)`),
+  `SL-X (pfx)` = unlist(`SL-X (pfx)`),
+  `SL-X (pi)` = unlist(`SL-X (pi)`),
+  `SL-Z (pfx)` = unlist(`SL-Z (pfx)`),
+  `SL-Z (pi)` = unlist(`SL-Z (pi)`),
+  `SLG` = unlist(`SLG`),
+  `SLv` = unlist(`SLv`),
+  `SO` = unlist(`SO`),
+  `Season` = unlist(`Season`),
+  `Soft%` = unlist(`Soft%`),
+  `Spd` = unlist(`Spd`),
+  `Strikes` = unlist(`Strikes`),
+  `SwStr%` = unlist(`SwStr%`),
+  `Swing%` = unlist(`Swing%`),
+  `Swing% (pfx)` = unlist(`Swing% (pfx)`),
+  `Swing% (pi)` = unlist(`Swing% (pi)`),
+  `TB_lg` = unlist(`TB_lg`),
+  `TOB_lg` = unlist(`TOB_lg`),
+  `TTO%` = unlist(`TTO%`),
+  `Team` = unlist(`Team`),
+  `UBR` = unlist(`UBR`),
+  `UN% (pfx)` = unlist(`UN% (pfx)`),
+  `WAA` = unlist(`WAA`),
+  `WAA_def` = unlist(`WAA_def`),
+  `WAA_off` = unlist(`WAA_off`),
+  `WAR.x` = unlist(`WAR.x`),
+  `WAR_def` = unlist(`WAR_def`),
+  `WAR_off` = unlist(`WAR_off`),
+  `WAR_rep` = unlist(`WAR_rep`),
+  `WPA` = unlist(`WPA`),
+  `WPA/LI` = unlist(`WPA/LI`),
+  `XX%` = unlist(`XX%`),
+  `XX% (pi)` = unlist(`XX% (pi)`),
+  `XX-X (pi)` = unlist(`XX-X (pi)`),
+  `XX-Z (pi)` = unlist(`XX-Z (pi)`),
+  `Z-Contact%` = unlist(`Z-Contact%`),
+  `Z-Contact% (pfx)` = unlist(`Z-Contact% (pfx)`),
+  `Z-Contact% (pi)` = unlist(`Z-Contact% (pi)`),
+  `Z-Swing%` = unlist(`Z-Swing%`),
+  `Z-Swing% (pfx)` = unlist(`Z-Swing% (pfx)`),
+  `Z-Swing% (pi)` = unlist(`Z-Swing% (pi)`),
+  `Zone%` = unlist(`Zone%`),
+  `Zone% (pfx)` = unlist(`Zone% (pfx)`),
+  `Zone% (pi)` = unlist(`Zone% (pi)`),
+  `age` = unlist(`age`),
+  `future_injury` = unlist(`future_injury`),
+  `future_num_10` = unlist(`future_num_10`),
+  `future_num_15` = unlist(`future_num_15`),
+  `future_num_60` = unlist(`future_num_60`),
+  `future_num_arm` = unlist(`future_num_arm`),
+  `future_num_back` = unlist(`future_num_back`),
+  `future_num_dtd` = unlist(`future_num_dtd`),
+  `future_num_elbow` = unlist(`future_num_elbow`),
+  `future_num_foot` = unlist(`future_num_foot`),
+  `future_num_hand` = unlist(`future_num_hand`),
+  `future_num_injuries` = unlist(`future_num_injuries`),
+  `future_num_knee` = unlist(`future_num_knee`),
+  `future_num_leg` = unlist(`future_num_leg`),
+  `future_num_minors` = unlist(`future_num_minors`),
+  `future_num_other` = unlist(`future_num_other`),
+  `future_num_out_for_season` = unlist(`future_num_out_for_season`),
+  `future_num_shoulder` = unlist(`future_num_shoulder`),
+  `future_num_surgeries` = unlist(`future_num_surgeries`),
+  `future_total_dl` = unlist(`future_total_dl`),
+  `include` = unlist(`include`),
+  `injury` = unlist(`injury`),
+  `lg_ID` = unlist(`lg_ID`),
+  `mlb_ID` = unlist(`mlb_ID`),
+  `name_common` = unlist(`name_common`),
+  `num_10` = unlist(`num_10`),
+  `num_15` = unlist(`num_15`),
+  `num_60` = unlist(`num_60`),
+  `num_arm` = unlist(`num_arm`),
+  `num_back` = unlist(`num_back`),
+  `num_dtd` = unlist(`num_dtd`),
+  `num_elbow` = unlist(`num_elbow`),
+  `num_foot` = unlist(`num_foot`),
+  `num_hand` = unlist(`num_hand`),
+  `num_injuries` = unlist(`num_injuries`),
+  `num_knee` = unlist(`num_knee`),
+  `num_leg` = unlist(`num_leg`),
+  `num_minors` = unlist(`num_minors`),
+  `num_other` = unlist(`num_other`),
+  `num_out_for_season` = unlist(`num_out_for_season`),
+  `num_shoulder` = unlist(`num_shoulder`),
+  `num_surgeries` = unlist(`num_surgeries`),
+  `oppRpG` = unlist(`oppRpG`),
+  `oppRpG_rep` = unlist(`oppRpG_rep`),
+  `oppRpPA_rep` = unlist(`oppRpPA_rep`),
+  `pLI` = unlist(`pLI`),
+  `phLI` = unlist(`phLI`),
+  `pitcher` = unlist(`pitcher`),
+  `player_ID` = unlist(`player_ID`),
+  `pyth_exponent` = unlist(`pyth_exponent`),
+  `pyth_exponent_rep` = unlist(`pyth_exponent_rep`),
+  `runs_above_avg` = unlist(`runs_above_avg`),
+  `runs_above_avg_def` = unlist(`runs_above_avg_def`),
+  `runs_above_avg_off` = unlist(`runs_above_avg_off`),
+  `runs_above_rep` = unlist(`runs_above_rep`),
+  `runs_bat` = unlist(`runs_bat`),
+  `runs_br` = unlist(`runs_br`),
+  `runs_catcher` = unlist(`runs_catcher`),
+  `runs_defense` = unlist(`runs_defense`),
+  `runs_dp` = unlist(`runs_dp`),
+  `runs_field` = unlist(`runs_field`),
+  `runs_good_plays` = unlist(`runs_good_plays`),
+  `runs_infield` = unlist(`runs_infield`),
+  `runs_outfield` = unlist(`runs_outfield`),
+  `runs_position` = unlist(`runs_position`),
+  `runs_position_p` = unlist(`runs_position_p`),
+  `runs_replacement` = unlist(`runs_replacement`),
+  `salary` = unlist(`salary`),
+  `stint_ID` = unlist(`stint_ID`),
+  `teamRpG` = unlist(`teamRpG`),
+  `team_ID` = unlist(`team_ID`),
+  `total_dl` = unlist(`total_dl`),
+  `vCH (pfx)` = unlist(`vCH (pfx)`),
+  `vCH (pi)` = unlist(`vCH (pi)`),
+  `vCS (pi)` = unlist(`vCS (pi)`),
+  `vCU (pfx)` = unlist(`vCU (pfx)`),
+  `vCU (pi)` = unlist(`vCU (pi)`),
+  `vEP (pfx)` = unlist(`vEP (pfx)`),
+  `vFA (pfx)` = unlist(`vFA (pfx)`),
+  `vFA (pi)` = unlist(`vFA (pi)`),
+  `vFC (pfx)` = unlist(`vFC (pfx)`),
+  `vFC (pi)` = unlist(`vFC (pi)`),
+  `vFO (pfx)` = unlist(`vFO (pfx)`),
+  `vFS (pfx)` = unlist(`vFS (pfx)`),
+  `vFS (pi)` = unlist(`vFS (pi)`),
+  `vFT (pfx)` = unlist(`vFT (pfx)`),
+  `vKC (pfx)` = unlist(`vKC (pfx)`),
+  `vKN (pfx)` = unlist(`vKN (pfx)`),
+  `vKN (pi)` = unlist(`vKN (pi)`),
+  `vSB (pi)` = unlist(`vSB (pi)`),
+  `vSC (pfx)` = unlist(`vSC (pfx)`),
+  `vSI (pfx)` = unlist(`vSI (pfx)`),
+  `vSI (pi)` = unlist(`vSI (pi)`),
+  `vSL (pfx)` = unlist(`vSL (pfx)`),
+  `vSL (pi)` = unlist(`vSL (pi)`),
+  `vXX (pi)` = unlist(`vXX (pi)`),
+  `wCB` = unlist(`wCB`),
+  `wCB/C` = unlist(`wCB/C`),
+  `wCH` = unlist(`wCH`),
+  `wCH (pfx)` = unlist(`wCH (pfx)`),
+  `wCH (pi)` = unlist(`wCH (pi)`),
+  `wCH/C` = unlist(`wCH/C`),
+  `wCH/C (pfx)` = unlist(`wCH/C (pfx)`),
+  `wCH/C (pi)` = unlist(`wCH/C (pi)`),
+  `wCS (pi)` = unlist(`wCS (pi)`),
+  `wCS/C (pi)` = unlist(`wCS/C (pi)`),
+  `wCT` = unlist(`wCT`),
+  `wCT/C` = unlist(`wCT/C`),
+  `wCU (pfx)` = unlist(`wCU (pfx)`),
+  `wCU (pi)` = unlist(`wCU (pi)`),
+  `wCU/C (pfx)` = unlist(`wCU/C (pfx)`),
+  `wCU/C (pi)` = unlist(`wCU/C (pi)`),
+  `wEP (pfx)` = unlist(`wEP (pfx)`),
+  `wEP/C (pfx)` = unlist(`wEP/C (pfx)`),
+  `wFA (pfx)` = unlist(`wFA (pfx)`),
+  `wFA (pi)` = unlist(`wFA (pi)`),
+  `wFA/C (pfx)` = unlist(`wFA/C (pfx)`),
+  `wFA/C (pi)` = unlist(`wFA/C (pi)`),
+  `wFB` = unlist(`wFB`),
+  `wFB/C` = unlist(`wFB/C`),
+  `wFC (pfx)` = unlist(`wFC (pfx)`),
+  `wFC (pi)` = unlist(`wFC (pi)`),
+  `wFC/C (pfx)` = unlist(`wFC/C (pfx)`),
+  `wFC/C (pi)` = unlist(`wFC/C (pi)`),
+  `wFO (pfx)` = unlist(`wFO (pfx)`),
+  `wFO/C (pfx)` = unlist(`wFO/C (pfx)`),
+  `wFS (pfx)` = unlist(`wFS (pfx)`),
+  `wFS (pi)` = unlist(`wFS (pi)`),
+  `wFS/C (pfx)` = unlist(`wFS/C (pfx)`),
+  `wFS/C (pi)` = unlist(`wFS/C (pi)`),
+  `wFT (pfx)` = unlist(`wFT (pfx)`),
+  `wFT/C (pfx)` = unlist(`wFT/C (pfx)`),
+  `wGDP` = unlist(`wGDP`),
+  `wKC (pfx)` = unlist(`wKC (pfx)`),
+  `wKC/C (pfx)` = unlist(`wKC/C (pfx)`),
+  `wKN` = unlist(`wKN`),
+  `wKN (pfx)` = unlist(`wKN (pfx)`),
+  `wKN (pi)` = unlist(`wKN (pi)`),
+  `wKN/C` = unlist(`wKN/C`),
+  `wKN/C (pfx)` = unlist(`wKN/C (pfx)`),
+  `wKN/C (pi)` = unlist(`wKN/C (pi)`),
+  `wOBA` = unlist(`wOBA`),
+  `wRAA` = unlist(`wRAA`),
+  `wRC` = unlist(`wRC`),
+  `wRC+` = unlist(`wRC+`),
+  `wSB` = unlist(`wSB`),
+  `wSB (pi)` = unlist(`wSB (pi)`),
+  `wSB/C (pi)` = unlist(`wSB/C (pi)`),
+  `wSC (pfx)` = unlist(`wSC (pfx)`),
+  `wSC/C (pfx)` = unlist(`wSC/C (pfx)`),
+  `wSF` = unlist(`wSF`),
+  `wSF/C` = unlist(`wSF/C`),
+  `wSI (pfx)` = unlist(`wSI (pfx)`),
+  `wSI (pi)` = unlist(`wSI (pi)`),
+  `wSI/C (pfx)` = unlist(`wSI/C (pfx)`),
+  `wSI/C (pi)` = unlist(`wSI/C (pi)`),
+  `wSL` = unlist(`wSL`),
+  `wSL (pfx)` = unlist(`wSL (pfx)`),
+  `wSL (pi)` = unlist(`wSL (pi)`),
+  `wSL/C` = unlist(`wSL/C`),
+  `wSL/C (pfx)` = unlist(`wSL/C (pfx)`),
+  `wSL/C (pi)` = unlist(`wSL/C (pi)`),
+  `wXX (pi)` = unlist(`wXX (pi)`),
+  `wXX/C (pi)` = unlist(`wXX/C (pi)`),
+  `waa_win_perc` = unlist(`waa_win_perc`),
+  `waa_win_perc_def` = unlist(`waa_win_perc_def`),
+  `waa_win_perc_off` = unlist(`waa_win_perc_off`),
+  `waa_win_perc_rep` = unlist(`waa_win_perc_rep`),
+  `year` = unlist(`year`),
+  `year_ID` = unlist(`year_ID`)
+)
+batter_df %>% write_csv('BATTER_INJURY_MASTER_FINAL.csv')
+batter_df %>% filter(include == 1) %>%  write_csv('BATTER_INJURY_MASTER_FINAL_INCLUDES.csv')
+```
+
+## Edit and save Pitchers
+
+```{r}
+pitcher_df <- py$pitcher_df %>% mutate(
+  `AVG` = unlist(`AVG`),
+  `Age` = unlist(`Age`),
+  `Age Rng` = unlist(`Age Rng`),
+  `BABIP` = unlist(`BABIP`),
+  `BB` = unlist(`BB`),
+  `BB%` = unlist(`BB%`),
+  `BB/9` = unlist(`BB/9`),
+  `BIP` = unlist(`BIP`),
+  `BIP-Wins` = unlist(`BIP-Wins`),
+  `BIP_perc` = unlist(`BIP_perc`),
+  `BK` = unlist(`BK`),
+  `BS` = unlist(`BS`),
+  `BU` = unlist(`BU`),
+  `BUH` = unlist(`BUH`),
+  `BUH%` = unlist(`BUH%`),
+  `Balls` = unlist(`Balls`),
+  `CB%` = unlist(`CB%`),
+  `CBv` = unlist(`CBv`),
+  `CG` = unlist(`CG`),
+  `CH%` = unlist(`CH%`),
+  `CH% (pfx)` = unlist(`CH% (pfx)`),
+  `CH% (pi)` = unlist(`CH% (pi)`),
+  `CH-X (pfx)` = unlist(`CH-X (pfx)`),
+  `CH-X (pi)` = unlist(`CH-X (pi)`),
+  `CH-Z (pfx)` = unlist(`CH-Z (pfx)`),
+  `CH-Z (pi)` = unlist(`CH-Z (pi)`),
+  `CHv` = unlist(`CHv`),
+  `CS% (pi)` = unlist(`CS% (pi)`),
+  `CS-X (pi)` = unlist(`CS-X (pi)`),
+  `CS-Z (pi)` = unlist(`CS-Z (pi)`),
+  `CT%` = unlist(`CT%`),
+  `CTv` = unlist(`CTv`),
+  `CU% (pfx)` = unlist(`CU% (pfx)`),
+  `CU% (pi)` = unlist(`CU% (pi)`),
+  `CU-X (pfx)` = unlist(`CU-X (pfx)`),
+  `CU-X (pi)` = unlist(`CU-X (pi)`),
+  `CU-Z (pfx)` = unlist(`CU-Z (pfx)`),
+  `CU-Z (pi)` = unlist(`CU-Z (pi)`),
+  `Cent%` = unlist(`Cent%`),
+  `Clutch` = unlist(`Clutch`),
+  `Contact%` = unlist(`Contact%`),
+  `Contact% (pfx)` = unlist(`Contact% (pfx)`),
+  `Contact% (pi)` = unlist(`Contact% (pi)`),
+  `Dollars` = unlist(`Dollars`),
+  `E-F` = unlist(`E-F`),
+  `EP% (pfx)` = unlist(`EP% (pfx)`),
+  `EP-X (pfx)` = unlist(`EP-X (pfx)`),
+  `EP-Z (pfx)` = unlist(`EP-Z (pfx)`),
+  `ER` = unlist(`ER`),
+  `ERA` = unlist(`ERA`),
+  `ERA-` = unlist(`ERA-`),
+  `ERA_plus` = unlist(`ERA_plus`),
+  `ER_lg` = unlist(`ER_lg`),
+  `F-Strike%` = unlist(`F-Strike%`),
+  `FA% (pfx)` = unlist(`FA% (pfx)`),
+  `FA% (pi)` = unlist(`FA% (pi)`),
+  `FA-X (pfx)` = unlist(`FA-X (pfx)`),
+  `FA-X (pi)` = unlist(`FA-X (pi)`),
+  `FA-Z (pfx)` = unlist(`FA-Z (pfx)`),
+  `FA-Z (pi)` = unlist(`FA-Z (pi)`),
+  `FB` = unlist(`FB`),
+  `FB%` = unlist(`FB%`),
+  `FBv` = unlist(`FBv`),
+  `FC% (pfx)` = unlist(`FC% (pfx)`),
+  `FC% (pi)` = unlist(`FC% (pi)`),
+  `FC-X (pfx)` = unlist(`FC-X (pfx)`),
+  `FC-X (pi)` = unlist(`FC-X (pi)`),
+  `FC-Z (pfx)` = unlist(`FC-Z (pfx)`),
+  `FC-Z (pi)` = unlist(`FC-Z (pi)`),
+  `FDP-Wins` = unlist(`FDP-Wins`),
+  `FIP` = unlist(`FIP`),
+  `FIP-` = unlist(`FIP-`),
+  `FO% (pfx)` = unlist(`FO% (pfx)`),
+  `FO-X (pfx)` = unlist(`FO-X (pfx)`),
+  `FO-Z (pfx)` = unlist(`FO-Z (pfx)`),
+  `FS% (pfx)` = unlist(`FS% (pfx)`),
+  `FS% (pi)` = unlist(`FS% (pi)`),
+  `FS-X (pfx)` = unlist(`FS-X (pfx)`),
+  `FS-X (pi)` = unlist(`FS-X (pi)`),
+  `FS-Z (pfx)` = unlist(`FS-Z (pfx)`),
+  `FS-Z (pi)` = unlist(`FS-Z (pi)`),
+  `FT% (pfx)` = unlist(`FT% (pfx)`),
+  `FT-X (pfx)` = unlist(`FT-X (pfx)`),
+  `FT-Z (pfx)` = unlist(`FT-Z (pfx)`),
+  `G.x` = unlist(`G.x`),
+  `G.y` = unlist(`G.y`),
+  `GB` = unlist(`GB`),
+  `GB%` = unlist(`GB%`),
+  `GB/FB` = unlist(`GB/FB`),
+  `GR_leverage_index_avg` = unlist(`GR_leverage_index_avg`),
+  `GS.x` = unlist(`GS.x`),
+  `GS.y` = unlist(`GS.y`),
+  `H` = unlist(`H`),
+  `H/9` = unlist(`H/9`),
+  `HBP` = unlist(`HBP`),
+  `HLD` = unlist(`HLD`),
+  `HR` = unlist(`HR`),
+  `HR/9` = unlist(`HR/9`),
+  `HR/FB` = unlist(`HR/FB`),
+  `Hard%` = unlist(`Hard%`),
+  `IBB` = unlist(`IBB`),
+  `IFFB` = unlist(`IFFB`),
+  `IFFB%` = unlist(`IFFB%`),
+  `IFH` = unlist(`IFH`),
+  `IFH%` = unlist(`IFH%`),
+  `IP` = unlist(`IP`),
+  `IPouts` = unlist(`IPouts`),
+  `IPouts_relief` = unlist(`IPouts_relief`),
+  `IPouts_start` = unlist(`IPouts_start`),
+  `K%` = unlist(`K%`),
+  `K-BB%` = unlist(`K-BB%`),
+  `K/9` = unlist(`K/9`),
+  `K/BB` = unlist(`K/BB`),
+  `KC% (pfx)` = unlist(`KC% (pfx)`),
+  `KC-X (pfx)` = unlist(`KC-X (pfx)`),
+  `KC-Z (pfx)` = unlist(`KC-Z (pfx)`),
+  `KN%` = unlist(`KN%`),
+  `KN% (pfx)` = unlist(`KN% (pfx)`),
+  `KN% (pi)` = unlist(`KN% (pi)`),
+  `KN-X (pfx)` = unlist(`KN-X (pfx)`),
+  `KN-X (pi)` = unlist(`KN-X (pi)`),
+  `KN-Z (pfx)` = unlist(`KN-Z (pfx)`),
+  `KN-Z (pi)` = unlist(`KN-Z (pi)`),
+  `KNv` = unlist(`KNv`),
+  `L` = unlist(`L`),
+  `LD` = unlist(`LD`),
+  `LD%` = unlist(`LD%`),
+  `LOB%` = unlist(`LOB%`),
+  `LOB-Wins` = unlist(`LOB-Wins`),
+  `MD` = unlist(`MD`),
+  `Med%` = unlist(`Med%`),
+  `Name` = unlist(`Name`),
+  `O-Contact%` = unlist(`O-Contact%`),
+  `O-Contact% (pfx)` = unlist(`O-Contact% (pfx)`),
+  `O-Contact% (pi)` = unlist(`O-Contact% (pi)`),
+  `O-Swing%` = unlist(`O-Swing%`),
+  `O-Swing% (pfx)` = unlist(`O-Swing% (pfx)`),
+  `O-Swing% (pi)` = unlist(`O-Swing% (pi)`),
+  `Oppo%` = unlist(`Oppo%`),
+  `PO%` = unlist(`PO%`),
+  `PPF` = unlist(`PPF`),
+  `PPF_custom` = unlist(`PPF_custom`),
+  `Pace` = unlist(`Pace`),
+  `Pace (pi)` = unlist(`Pace (pi)`),
+  `Pitches` = unlist(`Pitches`),
+  `Pull%` = unlist(`Pull%`),
+  `Pulls` = unlist(`Pulls`),
+  `R` = unlist(`R`),
+  `RA` = unlist(`RA`),
+  `RA9-WAR` = unlist(`RA9-WAR`),
+  `RAR` = unlist(`RAR`),
+  `RE24` = unlist(`RE24`),
+  `REW` = unlist(`REW`),
+  `RS` = unlist(`RS`),
+  `RS/9` = unlist(`RS/9`),
+  `RS_def_total` = unlist(`RS_def_total`),
+  `Relief-IP` = unlist(`Relief-IP`),
+  `Relieving` = unlist(`Relieving`),
+  `Relinquished` = unlist(`Relinquished`),
+  `RpO_replacement` = unlist(`RpO_replacement`),
+  `SB% (pi)` = unlist(`SB% (pi)`),
+  `SB-X (pi)` = unlist(`SB-X (pi)`),
+  `SB-Z (pi)` = unlist(`SB-Z (pi)`),
+  `SC% (pfx)` = unlist(`SC% (pfx)`),
+  `SC-X (pfx)` = unlist(`SC-X (pfx)`),
+  `SC-Z (pfx)` = unlist(`SC-Z (pfx)`),
+  `SD` = unlist(`SD`),
+  `SF%` = unlist(`SF%`),
+  `SFv` = unlist(`SFv`),
+  `SI% (pfx)` = unlist(`SI% (pfx)`),
+  `SI% (pi)` = unlist(`SI% (pi)`),
+  `SI-X (pfx)` = unlist(`SI-X (pfx)`),
+  `SI-X (pi)` = unlist(`SI-X (pi)`),
+  `SI-Z (pfx)` = unlist(`SI-Z (pfx)`),
+  `SI-Z (pi)` = unlist(`SI-Z (pi)`),
+  `SIERA` = unlist(`SIERA`),
+  `SL%` = unlist(`SL%`),
+  `SL% (pfx)` = unlist(`SL% (pfx)`),
+  `SL% (pi)` = unlist(`SL% (pi)`),
+  `SL-X (pfx)` = unlist(`SL-X (pfx)`),
+  `SL-X (pi)` = unlist(`SL-X (pi)`),
+  `SL-Z (pfx)` = unlist(`SL-Z (pfx)`),
+  `SL-Z (pi)` = unlist(`SL-Z (pi)`),
+  `SLv` = unlist(`SLv`),
+  `SO` = unlist(`SO`),
+  `SV` = unlist(`SV`),
+  `Season` = unlist(`Season`),
+  `ShO` = unlist(`ShO`),
+  `Soft%` = unlist(`Soft%`),
+  `Start-IP` = unlist(`Start-IP`),
+  `Starting` = unlist(`Starting`),
+  `Strikes` = unlist(`Strikes`),
+  `SwStr%` = unlist(`SwStr%`),
+  `Swing%` = unlist(`Swing%`),
+  `Swing% (pfx)` = unlist(`Swing% (pfx)`),
+  `Swing% (pi)` = unlist(`Swing% (pi)`),
+  `TBF` = unlist(`TBF`),
+  `TTO%` = unlist(`TTO%`),
+  `Team` = unlist(`Team`),
+  `UN% (pfx)` = unlist(`UN% (pfx)`),
+  `W` = unlist(`W`),
+  `WAA` = unlist(`WAA`),
+  `WAA_adj` = unlist(`WAA_adj`),
+  `WAR.x` = unlist(`WAR.x`),
+  `WAR.y` = unlist(`WAR.y`),
+  `WAR_rep` = unlist(`WAR_rep`),
+  `WHIP` = unlist(`WHIP`),
+  `WP` = unlist(`WP`),
+  `WPA` = unlist(`WPA`),
+  `WPA/LI` = unlist(`WPA/LI`),
+  `XX%` = unlist(`XX%`),
+  `XX% (pi)` = unlist(`XX% (pi)`),
+  `XX-X (pi)` = unlist(`XX-X (pi)`),
+  `XX-Z (pi)` = unlist(`XX-Z (pi)`),
+  `Z-Contact%` = unlist(`Z-Contact%`),
+  `Z-Contact% (pfx)` = unlist(`Z-Contact% (pfx)`),
+  `Z-Contact% (pi)` = unlist(`Z-Contact% (pi)`),
+  `Z-Swing%` = unlist(`Z-Swing%`),
+  `Z-Swing% (pfx)` = unlist(`Z-Swing% (pfx)`),
+  `Z-Swing% (pi)` = unlist(`Z-Swing% (pi)`),
+  `Zone%` = unlist(`Zone%`),
+  `Zone% (pfx)` = unlist(`Zone% (pfx)`),
+  `Zone% (pi)` = unlist(`Zone% (pi)`),
+  `age` = unlist(`age`),
+  `exLI` = unlist(`exLI`),
+  `future_injury` = unlist(`future_injury`),
+  `future_num_10` = unlist(`future_num_10`),
+  `future_num_15` = unlist(`future_num_15`),
+  `future_num_60` = unlist(`future_num_60`),
+  `future_num_arm` = unlist(`future_num_arm`),
+  `future_num_back` = unlist(`future_num_back`),
+  `future_num_dtd` = unlist(`future_num_dtd`),
+  `future_num_elbow` = unlist(`future_num_elbow`),
+  `future_num_foot` = unlist(`future_num_foot`),
+  `future_num_hand` = unlist(`future_num_hand`),
+  `future_num_injuries` = unlist(`future_num_injuries`),
+  `future_num_knee` = unlist(`future_num_knee`),
+  `future_num_leg` = unlist(`future_num_leg`),
+  `future_num_minors` = unlist(`future_num_minors`),
+  `future_num_other` = unlist(`future_num_other`),
+  `future_num_out_for_season` = unlist(`future_num_out_for_season`),
+  `future_num_shoulder` = unlist(`future_num_shoulder`),
+  `future_num_surgeries` = unlist(`future_num_surgeries`),
+  `future_total_dl` = unlist(`future_total_dl`),
+  `gmLI` = unlist(`gmLI`),
+  `inLI` = unlist(`inLI`),
+  `include` = unlist(`include`),
+  `injury` = unlist(`injury`),
+  `kwERA` = unlist(`kwERA`),
+  `lg_ID` = unlist(`lg_ID`),
+  `mlb_ID` = unlist(`mlb_ID`),
+  `name_common` = unlist(`name_common`),
+  `neg_WPA` = unlist(`neg_WPA`),
+  `num_10` = unlist(`num_10`),
+  `num_15` = unlist(`num_15`),
+  `num_60` = unlist(`num_60`),
+  `num_arm` = unlist(`num_arm`),
+  `num_back` = unlist(`num_back`),
+  `num_dtd` = unlist(`num_dtd`),
+  `num_elbow` = unlist(`num_elbow`),
+  `num_foot` = unlist(`num_foot`),
+  `num_hand` = unlist(`num_hand`),
+  `num_injuries` = unlist(`num_injuries`),
+  `num_knee` = unlist(`num_knee`),
+  `num_leg` = unlist(`num_leg`),
+  `num_minors` = unlist(`num_minors`),
+  `num_other` = unlist(`num_other`),
+  `num_out_for_season` = unlist(`num_out_for_season`),
+  `num_shoulder` = unlist(`num_shoulder`),
+  `num_surgeries` = unlist(`num_surgeries`),
+  `oppRpG` = unlist(`oppRpG`),
+  `oppRpG_rep` = unlist(`oppRpG_rep`),
+  `pLI` = unlist(`pLI`),
+  `pitcher` = unlist(`pitcher`),
+  `player_ID` = unlist(`player_ID`),
+  `pos_WPA` = unlist(`pos_WPA`),
+  `pyth_exponent` = unlist(`pyth_exponent`),
+  `pyth_exponent_rep` = unlist(`pyth_exponent_rep`),
+  `runs_above_avg` = unlist(`runs_above_avg`),
+  `runs_above_avg_adj` = unlist(`runs_above_avg_adj`),
+  `runs_above_rep` = unlist(`runs_above_rep`),
+  `salary` = unlist(`salary`),
+  `stint_ID` = unlist(`stint_ID`),
+  `tERA` = unlist(`tERA`),
+  `teamRpG` = unlist(`teamRpG`),
+  `team_ID` = unlist(`team_ID`),
+  `total_dl` = unlist(`total_dl`),
+  `vCH (pfx)` = unlist(`vCH (pfx)`),
+  `vCH (pi)` = unlist(`vCH (pi)`),
+  `vCS (pi)` = unlist(`vCS (pi)`),
+  `vCU (pfx)` = unlist(`vCU (pfx)`),
+  `vCU (pi)` = unlist(`vCU (pi)`),
+  `vEP (pfx)` = unlist(`vEP (pfx)`),
+  `vFA (pfx)` = unlist(`vFA (pfx)`),
+  `vFA (pi)` = unlist(`vFA (pi)`),
+  `vFC (pfx)` = unlist(`vFC (pfx)`),
+  `vFC (pi)` = unlist(`vFC (pi)`),
+  `vFO (pfx)` = unlist(`vFO (pfx)`),
+  `vFS (pfx)` = unlist(`vFS (pfx)`),
+  `vFS (pi)` = unlist(`vFS (pi)`),
+  `vFT (pfx)` = unlist(`vFT (pfx)`),
+  `vKC (pfx)` = unlist(`vKC (pfx)`),
+  `vKN (pfx)` = unlist(`vKN (pfx)`),
+  `vKN (pi)` = unlist(`vKN (pi)`),
+  `vSB (pi)` = unlist(`vSB (pi)`),
+  `vSC (pfx)` = unlist(`vSC (pfx)`),
+  `vSI (pfx)` = unlist(`vSI (pfx)`),
+  `vSI (pi)` = unlist(`vSI (pi)`),
+  `vSL (pfx)` = unlist(`vSL (pfx)`),
+  `vSL (pi)` = unlist(`vSL (pi)`),
+  `vXX (pi)` = unlist(`vXX (pi)`),
+  `wCB` = unlist(`wCB`),
+  `wCB/C` = unlist(`wCB/C`),
+  `wCH` = unlist(`wCH`),
+  `wCH (pfx)` = unlist(`wCH (pfx)`),
+  `wCH (pi)` = unlist(`wCH (pi)`),
+  `wCH/C` = unlist(`wCH/C`),
+  `wCH/C (pfx)` = unlist(`wCH/C (pfx)`),
+  `wCH/C (pi)` = unlist(`wCH/C (pi)`),
+  `wCS (pi)` = unlist(`wCS (pi)`),
+  `wCS/C (pi)` = unlist(`wCS/C (pi)`),
+  `wCT` = unlist(`wCT`),
+  `wCT/C` = unlist(`wCT/C`),
+  `wCU (pfx)` = unlist(`wCU (pfx)`),
+  `wCU (pi)` = unlist(`wCU (pi)`),
+  `wCU/C (pfx)` = unlist(`wCU/C (pfx)`),
+  `wCU/C (pi)` = unlist(`wCU/C (pi)`),
+  `wEP (pfx)` = unlist(`wEP (pfx)`),
+  `wEP/C (pfx)` = unlist(`wEP/C (pfx)`),
+  `wFA (pfx)` = unlist(`wFA (pfx)`),
+  `wFA (pi)` = unlist(`wFA (pi)`),
+  `wFA/C (pfx)` = unlist(`wFA/C (pfx)`),
+  `wFA/C (pi)` = unlist(`wFA/C (pi)`),
+  `wFB` = unlist(`wFB`),
+  `wFB/C` = unlist(`wFB/C`),
+  `wFC (pfx)` = unlist(`wFC (pfx)`),
+  `wFC (pi)` = unlist(`wFC (pi)`),
+  `wFC/C (pfx)` = unlist(`wFC/C (pfx)`),
+  `wFC/C (pi)` = unlist(`wFC/C (pi)`),
+  `wFO (pfx)` = unlist(`wFO (pfx)`),
+  `wFO/C (pfx)` = unlist(`wFO/C (pfx)`),
+  `wFS (pfx)` = unlist(`wFS (pfx)`),
+  `wFS (pi)` = unlist(`wFS (pi)`),
+  `wFS/C (pfx)` = unlist(`wFS/C (pfx)`),
+  `wFS/C (pi)` = unlist(`wFS/C (pi)`),
+  `wFT (pfx)` = unlist(`wFT (pfx)`),
+  `wFT/C (pfx)` = unlist(`wFT/C (pfx)`),
+  `wKC (pfx)` = unlist(`wKC (pfx)`),
+  `wKC/C (pfx)` = unlist(`wKC/C (pfx)`),
+  `wKN` = unlist(`wKN`),
+  `wKN (pfx)` = unlist(`wKN (pfx)`),
+  `wKN (pi)` = unlist(`wKN (pi)`),
+  `wKN/C` = unlist(`wKN/C`),
+  `wKN/C (pfx)` = unlist(`wKN/C (pfx)`),
+  `wKN/C (pi)` = unlist(`wKN/C (pi)`),
+  `wSB (pi)` = unlist(`wSB (pi)`),
+  `wSB/C (pi)` = unlist(`wSB/C (pi)`),
+  `wSC (pfx)` = unlist(`wSC (pfx)`),
+  `wSC/C (pfx)` = unlist(`wSC/C (pfx)`),
+  `wSF` = unlist(`wSF`),
+  `wSF/C` = unlist(`wSF/C`),
+  `wSI (pfx)` = unlist(`wSI (pfx)`),
+  `wSI (pi)` = unlist(`wSI (pi)`),
+  `wSI/C (pfx)` = unlist(`wSI/C (pfx)`),
+  `wSI/C (pi)` = unlist(`wSI/C (pi)`),
+  `wSL` = unlist(`wSL`),
+  `wSL (pfx)` = unlist(`wSL (pfx)`),
+  `wSL (pi)` = unlist(`wSL (pi)`),
+  `wSL/C` = unlist(`wSL/C`),
+  `wSL/C (pfx)` = unlist(`wSL/C (pfx)`),
+  `wSL/C (pi)` = unlist(`wSL/C (pi)`),
+  `wXX (pi)` = unlist(`wXX (pi)`),
+  `wXX/C (pi)` = unlist(`wXX/C (pi)`),
+  `waa_win_perc` = unlist(`waa_win_perc`),
+  `waa_win_perc_rep` = unlist(`waa_win_perc_rep`),
+  `xFIP` = unlist(`xFIP`),
+  `xFIP-` = unlist(`xFIP-`),
+  `xRA` = unlist(`xRA`),
+  `xRA_def_pitcher` = unlist(`xRA_def_pitcher`),
+  `xRA_final` = unlist(`xRA_final`),
+  `xRA_sprp_adj` = unlist(`xRA_sprp_adj`),
+  `year` = unlist(`year`),
+  `year_ID` = unlist(`year_ID`)
+)
+pitcher_df %>% write_csv('PITCHER_INJURY_MASTER_FINAL.csv')
+pitcher_df %>% filter(include == 1) %>%  write_csv('PITCHER_INJURY_MASTER_FINAL_INCLUDES.csv')
+
+```
+
+## Quick python sandbox for helping to make the above unlisting commands  
+
+Call df %>% colnames, copy into the l string below:  
+  
+```{python}
+l = ''' '''.strip()
+import re
+l = re.sub('\[\d+\]','',l)
+l = re.split('\"\s+\"', l)
+l = [x.strip().replace('"','') for x in l]
+for x in l:
+  print('`{0}` = unlist(`{0}`),'.format(x))
+
+```
